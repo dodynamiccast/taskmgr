@@ -1,16 +1,32 @@
 package taskmgr
 
 import (
+	"fmt"
 	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/dodynamiccast/log"
-	"github.com/dodynamiccast/pool"
 )
+
+type logger interface {
+	Printf(sfmt string, args ...interface{})
+	Panic(args ...interface{})
+}
+
+type defaultLogger struct {
+}
+
+func (l *defaultLogger) Printf(sfmt string, args ...interface{}) {
+	fmt.Printf(sfmt+"\n", args...)
+}
+
+func (l *defaultLogger) Panic(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+var Log = logger(&defaultLogger{})
 
 const (
 	FLAG_RUNNING    = 1
@@ -21,13 +37,12 @@ const (
 
 type HTaskNode struct {
 	args     []reflect.Value
-	callFunc *reflect.Value
+	callFunc reflect.Value
 	resChan  chan int
-
-	retValue []interface{}
 
 	hashKey uint64
 	isOrder bool
+	isSync  bool
 
 	next *HTaskNode
 }
@@ -42,7 +57,7 @@ type TaskCtx struct {
 
 func (tc *TaskCtx) Print() {
 	for tc != nil {
-		log.Printf("tc %+v", tc)
+		Log.Printf("tc %+v", tc)
 		tc = tc.parent
 	}
 }
@@ -81,25 +96,24 @@ type TaskMgr struct {
 	threadNum    int32
 	minThreadNum int32
 	idleNum      int32
-	nodePool     pool.ObjPool
 	threadLock   sync.Mutex
 	isFixNum     bool
 	taskId       int
 
-	hashNodePool pool.ObjPool
-	hashLock     sync.RWMutex
-	hashMap      map[uint64]*TaskHashNode //执行状态以及等待队列
+	hashLock sync.RWMutex
+	listLock sync.Mutex
+	hashMap  map[uint64]*TaskHashNode //执行状态以及等待队列
 }
 
 func (tm *TaskMgr) onFunPanic(task *HTaskNode) {
-	log.StLogger.WriteLog(log.PanicLevel, 1, "get panic :", task.args)
+	Log.Panic("get panic :", task.args)
 	if task.callFunc.Kind() != reflect.Func {
-		log.StLogger.WriteLog(log.PanicLevel, 1, "get panic :", "func type error")
+		Log.Panic("get panic :", "func type error")
 		return
 	}
 	f := runtime.FuncForPC(task.callFunc.Pointer())
 	file, l := f.FileLine(f.Entry())
-	log.StLogger.WriteLog(log.PanicLevel, 1, "get panic :", file, ":", l, " ", f.Name())
+	Log.Panic("get panic :", file, ":", l, " ", f.Name())
 }
 
 func (tm *TaskMgr) run() {
@@ -111,18 +125,18 @@ func (tm *TaskMgr) run() {
 		if exitFlag == FLAG_BEGIN_EXIT {
 			return
 		} else {
-			log.StLogger.WriteLog(log.PanicLevel, 1, string(debug.Stack()))
+			Log.Panic(string(debug.Stack()))
 			if task != nil {
 				task.resChan <- 0
 				tm.onFunPanic(task)
 			}
 			if err := recover(); err != nil {
-				log.StLogger.WriteLog(log.PanicLevel, 1, err)
+				Log.Panic(err)
 			}
 		}
 		if task != nil {
 			task = tm.onTaskDone(task)
-			if task != nil {
+			if task != nil && task.isSync {
 				tm.taskChan <- task
 			}
 		}
@@ -139,7 +153,6 @@ func (tm *TaskMgr) run() {
 
 for_run_routine:
 	for {
-		//var task *HTaskNode
 		if task == nil {
 			select {
 			case task = <-tm.taskChan:
@@ -148,9 +161,11 @@ for_run_routine:
 				break for_run_routine
 			}
 		}
-		(*(task.callFunc)).Call(task.args)
+		task.callFunc.Call(task.args)
 
-		task.resChan <- 0
+		if task.isSync {
+			task.resChan <- 0
+		}
 		task = tm.onTaskDone(task)
 	}
 }
@@ -172,15 +187,12 @@ func (tm *TaskMgr) recycleRoutine() {
 }
 
 func (tm *TaskMgr) Start(maxThreadNum int, minThreadNum int, chanLen int, isFixNum bool) {
-	tm.nodePool.InitRv(reflect.TypeOf((*HTaskNode)(nil)), minThreadNum)
-	//tm.hashNodePool.InitRv(reflect.TypeOf((*TaskHashNode)(nil)), 1000)
 	tm.minThreadNum = (int32)(minThreadNum)
 	tm.maxThreadNum = (int32)(maxThreadNum)
 	tm.taskChan = make(chan *HTaskNode, chanLen)
 	tm.exitChan = make(chan int, minThreadNum)
 	tm.isFixNum = isFixNum
 	tm.hashMap = make(map[uint64]*TaskHashNode)
-	tm.hashNodePool.InitRv(reflect.TypeOf((*TaskHashNode)(nil)), minThreadNum)
 
 	if tm.isFixNum == false {
 		go tm.recycleRoutine()
@@ -192,23 +204,7 @@ func (tm *TaskMgr) Start(maxThreadNum int, minThreadNum int, chanLen int, isFixN
 	}*/
 }
 
-func (tm *TaskMgr) recycleNode(node *HTaskNode) {
-	node.args = nil
-	node.callFunc = nil
-	node.retValue = nil
-	node.isOrder = false
-	tm.nodePool.Free(node)
-}
-
-func (tm *TaskMgr) recycleHashNode(node *TaskHashNode) {
-	node.isRunning = false
-	//node.fQueue = make(list.List)
-	tm.hashNodePool.Free(node)
-}
-
 func (tm *TaskMgr) onTaskDone(task *HTaskNode) *HTaskNode {
-	defer tm.recycleNode(task)
-	defer Waiter.Done()
 	if task.isOrder == false {
 		return nil
 	}
@@ -221,7 +217,6 @@ func (tm *TaskMgr) onTaskDone(task *HTaskNode) *HTaskNode {
 	//否则取出头部元素，放入执行队列
 	if hashNode.fQueueHead == nil {
 		delete(tm.hashMap, task.hashKey)
-		tm.recycleHashNode(hashNode)
 		tm.hashLock.Unlock()
 		//fmt.Printf("clean queue\n")
 	} else {
@@ -252,8 +247,9 @@ func (tm *TaskMgr) addTask(task *HTaskNode) {
 		tm.hashLock.Lock()
 		//进入写锁后，需要再次检查节点是否存在
 		if hashNode, ok = tm.hashMap[task.hashKey]; !ok {
-			hashNode = tm.hashNodePool.Alloc().(*TaskHashNode)
+			//hashNode = tm.hashNodePool.Alloc().(*TaskHashNode)
 			//hashNode.Lock()
+			var hashNode = new(TaskHashNode)
 			hashNode.fQueueTail = nil
 			hashNode.fQueueHead = nil
 			hashNode.isRunning = true
@@ -321,7 +317,7 @@ func checkFunc(f *reflect.Value) {
 
 func (tm *TaskMgr) callGo(isOrder bool, hashKey uint64, cf interface{}, args ...interface{}) error {
 	//fmt.Printf("and func %+v\n", hashKey)
-	task := tm.nodePool.Alloc().(*HTaskNode)
+	var task = new(HTaskNode)
 	task.args = make([]reflect.Value, len(args))
 	for i := 0; i < len(args); i++ {
 		task.args[i] = reflect.ValueOf(args[i])
@@ -329,15 +325,18 @@ func (tm *TaskMgr) callGo(isOrder bool, hashKey uint64, cf interface{}, args ...
 
 	callFunc := reflect.ValueOf(cf)
 	checkFunc(&callFunc)
-	task.callFunc = &callFunc
+	task.callFunc = callFunc
 	task.hashKey = hashKey
 	task.isOrder = isOrder
+	task.isSync = false
 	Waiter.Add(1)
 
 	if (tm.threadNum < tm.maxThreadNum && len(tm.taskChan) >= cap(tm.taskChan)) || tm.threadNum < tm.minThreadNum {
 		go tm.run()
 	}
-	task.resChan = make(chan int, 1)
+	/*if task.resChan == nil {
+		task.resChan = make(chan int, 1)
+	}*/
 	if !isOrder {
 		tm.taskChan <- task
 	} else {
@@ -348,7 +347,7 @@ func (tm *TaskMgr) callGo(isOrder bool, hashKey uint64, cf interface{}, args ...
 
 func (tm *TaskMgr) callGroup(isOrder bool, hashKey uint64, cf interface{}, args ...interface{}) chan int {
 	//fmt.Printf("and func %+v\n", hashKey)
-	task := tm.nodePool.Alloc().(*HTaskNode)
+	var task = new(HTaskNode)
 	task.args = make([]reflect.Value, len(args))
 	for i := 0; i < len(args); i++ {
 		task.args[i] = reflect.ValueOf(args[i])
@@ -356,11 +355,14 @@ func (tm *TaskMgr) callGroup(isOrder bool, hashKey uint64, cf interface{}, args 
 
 	callFunc := reflect.ValueOf(cf)
 	checkFunc(&callFunc)
-	task.callFunc = &callFunc
+	task.callFunc = callFunc
 	task.hashKey = hashKey
 	task.isOrder = isOrder
+	task.isSync = true
 	Waiter.Add(1)
-
+	if task.resChan == nil {
+		task.resChan = make(chan int, 1)
+	}
 	if (tm.threadNum < tm.maxThreadNum && len(tm.taskChan) >= cap(tm.taskChan)) || tm.threadNum < tm.minThreadNum {
 		go tm.run()
 	}
@@ -374,19 +376,22 @@ func (tm *TaskMgr) callGroup(isOrder bool, hashKey uint64, cf interface{}, args 
 }
 
 func (tm *TaskMgr) call(isOrder bool, hashKey uint64, cf interface{}, args ...interface{}) {
-	task := tm.nodePool.Alloc().(*HTaskNode)
+	var task = new(HTaskNode)
 	task.args = make([]reflect.Value, len(args))
 	for i := 0; i < len(args); i++ {
 		task.args[i] = reflect.ValueOf(args[i])
 	}
 
 	callFunc := reflect.ValueOf(cf)
-	if callFunc.Kind() != reflect.Func {
-	}
-	task.callFunc = &callFunc
+	checkFunc(&callFunc)
+	task.callFunc = callFunc
 	checkFunc(&callFunc)
 	task.hashKey = hashKey
 	task.isOrder = isOrder
+	task.isSync = true
+	if task.resChan == nil {
+		task.resChan = make(chan int, 1)
+	}
 	Waiter.Add(1)
 
 	if (tm.threadNum < tm.maxThreadNum && len(tm.taskChan) >= cap(tm.taskChan)) || tm.threadNum < tm.minThreadNum {
